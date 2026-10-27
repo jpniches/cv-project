@@ -1,0 +1,10 @@
+path: C:/dev/cv-python/data/detector
+train: images/train
+val: images/val
+names:
+  0: caixa-preta
+  1: caixa-verde
+  2: caixa-azul
+  3: caixa-cinza
+  4: caixa-vermelha
+  5: caixa-fechada
