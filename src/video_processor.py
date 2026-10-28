@@ -8,8 +8,8 @@ from pathlib import Path
 import cv2
 from ultralytics import YOLO
 
-from src.model import get_model
-from src.video_optimizer import VideoOptimizer
+from src.utils.model import get_model
+from src.utils.video_optimizer import VideoOptimizer
 
 
 # Diretório destinado ao armazenamento dos vídeos processados.
