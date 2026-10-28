@@ -2,10 +2,17 @@
 # Realiza otimização, detecção, rastreamento e contagem de objetos.
 # O processamento é acionado por uma rota definida no api.py.
 
+import gc
+import logging
+import os
+
 from collections.abc import Callable
 from pathlib import Path
 
 import cv2
+import psutil
+import torch
+
 from ultralytics import YOLO
 
 from src.utils.model import get_model
@@ -22,6 +29,10 @@ CONFIDENCE = 0.25
 IMAGE_SIZE = 640
 MIN_TRACK_SECONDS = 1.5
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+
+MEMORY_LOG_INTERVAL = 100
+GARBAGE_COLLECTION_INTERVAL = 300
+PENDING_TRACK_EXPIRATION_SECONDS = 5.0
 
 
 # Classes de objetos utilizadas no treinamento do modelo.
@@ -42,6 +53,20 @@ StageCallback = Callable[[str], None]
 TrackingCallback = Callable[[list[dict], dict], None]
 
 
+logger = logging.getLogger(__name__)
+
+
+def log_memory(stage: str) -> None:
+    process = psutil.Process(os.getpid())
+    memory_mb = process.memory_info().rss / 1024 / 1024
+
+    logger.info(
+        "[MEMORY] %s: %.1f MB",
+        stage,
+        memory_mb,
+    )
+
+
 # Inicializa o resumo de rastreamento com os contadores zerados.
 def empty_tracking_summary() -> dict:
     return {
@@ -58,7 +83,7 @@ def build_tracking_summary(boxes: list[dict]) -> dict:
     summary["total"] = len(boxes)
 
     for item in boxes:
-        class_name = item["classe"]
+        class_name = item["class"]
 
         if class_name in EXPECTED_CLASSES:
             summary[class_name] += 1
@@ -135,7 +160,7 @@ def process_video(
 
         boxes = sorted(
             (item.copy() for item in tracked_objects.values()),
-            key=lambda item: item["ordem"],
+            key=lambda item: item["order"],
         )
 
         tracking_callback(
@@ -144,12 +169,20 @@ def process_video(
         )
 
     try:
+        log_memory(
+            f"{input_path.name}: antes da otimização"
+        )
+
         if stage_callback:
             stage_callback("optimizing")
 
         # Otimiza o vídeo de entrada antes de iniciar a detecção.
-        print(f"Otimizando vídeo: {input_path.name}")
+        print(f"Otimizando vídeo: {input_path.name}", flush=True)
         optimized_path = optimizer.optimize(input_path)
+
+        log_memory(
+            f"{input_path.name}: depois da otimização"
+        )
 
         capture = cv2.VideoCapture(str(optimized_path))
 
@@ -179,6 +212,11 @@ def process_video(
             round(fps * MIN_TRACK_SECONDS),
         )
 
+        pending_track_expiration_frames = max(
+            min_track_frames + 1,
+            round(fps * PENDING_TRACK_EXPIRATION_SECONDS),
+        )
+
         output_path = get_output_path(input_path)
 
         # Inicializa a gravação do vídeo com as detecções identificadas.
@@ -203,7 +241,12 @@ def process_video(
         print(
             f"Processando {input_path.name}: "
             f"{width}x{height}, {fps:.2f} FPS, "
-            f"{total_frames} frames estimados"
+            f"{total_frames} frames estimados",
+            flush=True,
+        )
+
+        log_memory(
+            f"{input_path.name}: antes da detecção"
         )
 
         # Percorre os frames do vídeo até finalizar sua leitura.
@@ -213,88 +256,160 @@ def process_video(
             if not success:
                 break
 
-            # Detecta e rastreia os objetos utilizando YOLO e ByteTrack.
-            results = model.track(
-                source=frame,
-                conf=CONFIDENCE,
-                imgsz=IMAGE_SIZE,
-                tracker="bytetrack.yaml",
-                persist=True,
-                verbose=False,
-            )
+            results = None
+            result = None
+            annotated_frame = None
+            boxes = None
+            track_ids = None
+            class_ids = None
+            confidences = None
 
-            result = results[0]
-            annotated_frame = result.plot()
-            frame_count += 1
+            try:
+                # Detecta e rastreia os objetos utilizando YOLO e ByteTrack.
+                with torch.inference_mode():
+                    results = model.track(
+                        source=frame,
+                        conf=CONFIDENCE,
+                        imgsz=IMAGE_SIZE,
+                        tracker="bytetrack.yaml",
+                        persist=True,
+                        verbose=False,
+                    )
 
-            boxes = result.boxes
+                if not results:
+                    writer.write(frame)
+                    frame_count += 1
 
-            # Extrai os identificadores, classes e níveis de confiança.
-            if boxes is not None and boxes.id is not None:
-                track_ids = boxes.id.int().cpu().tolist()
-                class_ids = boxes.cls.int().cpu().tolist()
-                confidences = boxes.conf.cpu().tolist()
+                    # Atualiza a visualização do frame, quando disponível.
+                    if frame_callback:
+                        frame_callback(frame)
 
-                for track_id, class_id, confidence in zip(
-                    track_ids,
-                    class_ids,
-                    confidences,
+                    # Atualiza o progresso do processamento.
+                    if progress_callback:
+                        progress_callback(
+                            frame_count,
+                            total_frames,
+                        )
+
+                    # Publica periodicamente os dados dos objetos rastreados.
+                    publish_tracking()
+                    continue
+
+                result = results[0]
+                annotated_frame = result.plot()
+                frame_count += 1
+
+                boxes = result.boxes
+
+                # Extrai os identificadores, classes e níveis de confiança.
+                if boxes is not None and boxes.id is not None:
+                    track_ids = boxes.id.int().cpu().tolist()
+                    class_ids = boxes.cls.int().cpu().tolist()
+                    confidences = boxes.conf.cpu().tolist()
+
+                    for track_id, class_id, confidence in zip(
+                        track_ids,
+                        class_ids,
+                        confidences,
+                    ):
+                        class_name = result.names.get(
+                            class_id,
+                            str(class_id),
+                        )
+
+                        # Verifica se o objeto já possui um registro de rastreamento.
+                        pending = pending_tracks.get(track_id)
+
+                        # Registra novos objetos ou atualiza os já identificados.
+                        if pending is None:
+                            pending = {
+                                "id": track_id,
+                                "order": next_track_order,
+                                "class": class_name,
+                                "confidence": round(
+                                    float(confidence),
+                                    4,
+                                ),
+                                "first_frame": frame_count,
+                                "last_frame": frame_count,
+                                "detection_count": 1,
+                            }
+
+                            pending_tracks[track_id] = pending
+                            next_track_order += 1
+                        else:
+                            pending["class"] = class_name
+                            pending["confidence"] = round(
+                                float(confidence),
+                                4,
+                            )
+                            pending["last_frame"] = frame_count
+                            pending["detection_count"] += 1
+
+                        # Calcula o intervalo de frames em que o objeto foi rastreado.
+                        duration_frames = (
+                            pending["last_frame"]
+                            - pending["first_frame"]
+                            + 1
+                        )
+
+                        # Considera apenas objetos rastreados pelo tempo mínimo.
+                        if duration_frames >= min_track_frames:
+                            tracked_objects[track_id] = pending.copy()
+
+                expired_track_ids = [
+                    track_id
+                    for track_id, pending in pending_tracks.items()
+                    if track_id not in tracked_objects
+                    and (
+                        frame_count - pending["last_frame"]
+                        > pending_track_expiration_frames
+                    )
+                ]
+
+                for track_id in expired_track_ids:
+                    pending_tracks.pop(track_id, None)
+
+                # Grava o frame com as detecções no vídeo de saída.
+                writer.write(annotated_frame)
+
+                # Atualiza a visualização do frame, quando disponível.
+                if frame_callback:
+                    frame_callback(annotated_frame)
+
+                # Atualiza o progresso do processamento.
+                if progress_callback:
+                    progress_callback(frame_count, total_frames)
+
+                # Publica periodicamente os dados dos objetos rastreados.
+                publish_tracking()
+
+                if frame_count % MEMORY_LOG_INTERVAL == 0:
+                    print(
+                        f"Frames processados: {frame_count}",
+                        flush=True,
+                    )
+
+                    log_memory(
+                        f"{input_path.name}: frame {frame_count}"
+                    )
+
+                if (
+                    frame_count
+                    % GARBAGE_COLLECTION_INTERVAL
+                    == 0
                 ):
-                    class_name = result.names.get(
-                        class_id,
-                        str(class_id),
-                    )
+                    gc.collect()
 
-                    # Verifica se o objeto já possui um registro de rastreamento.
-                    pending = pending_tracks.get(track_id)
-
-                    # Registra novos objetos ou atualiza os já identificados.
-                    if pending is None:
-                        pending = {
-                            "id": track_id,
-                            "ordem": next_track_order,
-                            "classe": class_name,
-                            "confianca": round(float(confidence), 4),
-                            "primeiro_frame": frame_count,
-                            "ultimo_frame": frame_count,
-                            "contagem_deteccoes": 1,
-                        }
-
-                        pending_tracks[track_id] = pending
-                        next_track_order += 1
-                    else:
-                        pending["classe"] = class_name
-                        pending["confianca"] = round(float(confidence), 4)
-                        pending["ultimo_frame"] = frame_count
-                        pending["contagem_deteccoes"] += 1
-
-                    # Calcula o intervalo de frames em que o objeto foi rastreado.
-                    duration_frames = (
-                        pending["ultimo_frame"]
-                        - pending["primeiro_frame"]
-                        + 1
-                    )
-
-                    # Considera apenas objetos rastreados pelo tempo mínimo.
-                    if duration_frames >= min_track_frames:
-                        tracked_objects[track_id] = pending
-
-            # Grava o frame com as detecções no vídeo de saída.
-            writer.write(annotated_frame)
-
-            # Atualiza a visualização do frame, quando disponível.
-            if frame_callback:
-                frame_callback(annotated_frame)
-
-            # Atualiza o progresso do processamento.
-            if progress_callback:
-                progress_callback(frame_count, total_frames)
-
-            # Publica periodicamente os dados dos objetos rastreados.
-            publish_tracking()
-
-            if frame_count % 100 == 0:
-                print(f"Frames processados: {frame_count}")
+            finally:
+                del confidences
+                del class_ids
+                del track_ids
+                del boxes
+                del annotated_frame
+                del result
+                del results
+                del frame
 
         if frame_count == 0:
             raise RuntimeError(
@@ -323,11 +438,20 @@ def process_video(
 
         if predictor is not None:
             for tracker in getattr(predictor, "trackers", []):
-                tracker.reset()
+                reset = getattr(tracker, "reset", None)
+
+                if callable(reset):
+                    reset()
 
         # Remove o arquivo temporário gerado durante a otimização.
         if optimized_path is not None:
             optimizer.cleanup(optimized_path)
+
+        gc.collect()
+
+        log_memory(
+            f"{input_path.name}: recursos liberados"
+        )
 
     # Verifica se o vídeo processado foi gerado corretamente.
     if (
@@ -347,10 +471,16 @@ def process_video(
         stage_callback("completed")
 
     # Exibe as informações finais do processamento.
-    print(f"Frames processados: {frame_count}")
-    print(f"Objetos rastreados: {len(tracked_objects)}")
-    print(f"Resumo: {build_tracking_summary(list(tracked_objects.values()))}")
-    print(f"Resultado salvo em: {output_path}")
+    final_boxes = list(tracked_objects.values())
+    final_summary = build_tracking_summary(final_boxes)
+
+    print(f"Frames processados: {frame_count}", flush=True)
+    print(
+        f"Objetos rastreados: {len(tracked_objects)}",
+        flush=True,
+    )
+    print(f"Resumo: {final_summary}", flush=True)
+    print(f"Resultado salvo em: {output_path}", flush=True)
 
     # Retorna o caminho do vídeo processado para utilização pela aplicação.
     return output_path

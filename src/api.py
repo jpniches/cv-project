@@ -2,7 +2,10 @@
 # Gerencia uploads, tarefas, rastreamento e disponibilização dos resultados.
 
 import asyncio
+import gc
 import logging
+import os
+import time
 import uuid
 
 from concurrent.futures import ThreadPoolExecutor
@@ -10,6 +13,7 @@ from pathlib import Path
 from threading import Lock
 
 import cv2
+import psutil
 
 from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket
 from fastapi.concurrency import run_in_threadpool
@@ -63,6 +67,56 @@ model_lock = Lock()
 
 logger = logging.getLogger(__name__)
 
+JOB_RETENTION_SECONDS = 60 * 60
+LIVE_FRAME_INTERVAL_SECONDS = 0.15
+MAX_UPLOAD_SIZE_BYTES = 500 * 1024 * 1024
+
+
+def log_memory(stage: str) -> None:
+    process = psutil.Process(os.getpid())
+    memory_mb = process.memory_info().rss / 1024 / 1024
+
+    logger.info(
+        "[MEMORY] %s: %.1f MB",
+        stage,
+        memory_mb,
+    )
+
+
+def cleanup_old_jobs(
+    max_age_seconds: int = JOB_RETENTION_SECONDS,
+) -> None:
+    now = time.time()
+    output_paths: list[Path] = []
+
+    with jobs_lock:
+        expired_job_ids = [
+            job_id
+            for job_id, job in jobs.items()
+            if job.get("finished_at") is not None
+            and now - job["finished_at"] > max_age_seconds
+        ]
+
+        for job_id in expired_job_ids:
+            job = jobs.pop(job_id, None)
+
+            if job is None:
+                continue
+
+            output_path = job.get("output_path")
+
+            if output_path:
+                output_paths.append(Path(output_path))
+
+    for output_path in output_paths:
+        try:
+            output_path.unlink(missing_ok=True)
+        except OSError:
+            logger.exception(
+                "Falha ao remover arquivo antigo %s",
+                output_path,
+            )
+
 
 # Atualiza a etapa atual do processamento.
 def update_stage(job_id: str, stage: str) -> None:
@@ -102,6 +156,24 @@ def update_tracking(
 
 # Prepara e armazena o frame mais recente para transmissão via WebSocket.
 def publish_frame(job_id: str, frame) -> None:
+    now = time.monotonic()
+
+    with jobs_lock:
+        job = jobs.get(job_id)
+
+        if job is None or job["status"] != "processing":
+            return
+
+        last_publish_at = job.get("last_frame_publish_at", 0.0)
+
+        if now - last_publish_at < LIVE_FRAME_INTERVAL_SECONDS:
+            return
+
+        job["last_frame_publish_at"] = now
+
+    if frame is None or not hasattr(frame, "shape"):
+        return
+
     height, width = frame.shape[:2]
     max_width = 720
 
@@ -124,18 +196,22 @@ def publish_frame(job_id: str, frame) -> None:
     if not success:
         return
 
+    encoded_bytes = encoded.tobytes()
+
     # Armazena o frame e atualiza seu identificador de sequência.
     with jobs_lock:
         job = jobs.get(job_id)
 
         if job and job["status"] == "processing":
-            job["live_frame"] = encoded.tobytes()
+            job["live_frame"] = encoded_bytes
             job["frame_seq"] = job.get("frame_seq", 0) + 1
 
 
 # Executa o processamento do vídeo e gerencia o estado da tarefa.
 def process_job(job_id: str, input_path: Path) -> None:
     try:
+        log_memory(f"{job_id}: antes de iniciar")
+
         with jobs_lock:
             job = jobs.get(job_id)
 
@@ -145,11 +221,16 @@ def process_job(job_id: str, input_path: Path) -> None:
             job.update(
                 status="processing",
                 stage="optimizing",
+                started_at=time.time(),
             )
+
+        log_memory(f"{job_id}: antes de carregar o modelo")
 
         # Impede o uso simultâneo do modelo YOLO.
         with model_lock:
             model = get_model()
+
+            log_memory(f"{job_id}: modelo carregado")
 
             # Executa o processamento e atualiza os dados pelos callbacks.
             output_path = process_video(
@@ -169,6 +250,8 @@ def process_job(job_id: str, input_path: Path) -> None:
                 ),
             )
 
+        log_memory(f"{job_id}: processamento concluído")
+
         # Registra a conclusão do processamento.
         with jobs_lock:
             job = jobs.get(job_id)
@@ -180,6 +263,8 @@ def process_job(job_id: str, input_path: Path) -> None:
                     progress=100,
                     output_path=str(output_path),
                     error=None,
+                    live_frame=None,
+                    finished_at=time.time(),
                 )
 
     # Registra possíveis erros durante o processamento.
@@ -197,22 +282,39 @@ def process_job(job_id: str, input_path: Path) -> None:
                     status="failed",
                     stage="failed",
                     error=str(exc),
+                    live_frame=None,
+                    tracked_boxes=[],
+                    finished_at=time.time(),
                 )
 
     finally:
         # Remove o arquivo original após o processamento.
         input_path.unlink(missing_ok=True)
 
+        gc.collect()
+
+        log_memory(f"{job_id}: limpeza finalizada")
+
 
 # Verifica se a API está em funcionamento.
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "memory_mb": round(
+            psutil.Process(os.getpid()).memory_info().rss
+            / 1024
+            / 1024,
+            1,
+        ),
+    }
 
 
 # Recebe um vídeo e inicia seu processamento em segundo plano.
 @app.post("/videos", status_code=202)
 async def upload_video(file: UploadFile = File(...)):
+    cleanup_old_jobs()
+
     filename = Path(file.filename or "").name
     extension = Path(filename).suffix.lower()
 
@@ -229,12 +331,28 @@ async def upload_video(file: UploadFile = File(...)):
     # Gera um identificador único para o vídeo enviado.
     job_id = uuid.uuid4().hex
     input_path = UPLOAD_DIR / f"{job_id}{extension}"
+    uploaded_size = 0
 
     try:
         # Salva o vídeo em partes para evitar carregá-lo inteiro na memória.
         with input_path.open("wb") as destination:
             while chunk := await file.read(1024 * 1024):
+                uploaded_size += len(chunk)
+
+                if uploaded_size > MAX_UPLOAD_SIZE_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            "O vídeo excede o limite máximo "
+                            "de 500 MB."
+                        ),
+                    )
+
                 destination.write(chunk)
+
+    except HTTPException:
+        input_path.unlink(missing_ok=True)
+        raise
 
     except Exception as exc:
         input_path.unlink(missing_ok=True)
@@ -271,8 +389,12 @@ async def upload_video(file: UploadFile = File(...)):
             "error": None,
             "live_frame": None,
             "frame_seq": 0,
+            "last_frame_publish_at": 0.0,
             "tracked_boxes": [],
             "tracking_summary": empty_tracking_summary(),
+            "created_at": time.time(),
+            "started_at": None,
+            "finished_at": None,
         }
 
     try:
@@ -303,6 +425,8 @@ async def upload_video(file: UploadFile = File(...)):
 # Retorna o estado, progresso e resultados de uma tarefa.
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str):
+    cleanup_old_jobs()
+
     with jobs_lock:
         job = jobs.get(job_id)
 
@@ -318,7 +442,11 @@ def get_job(job_id: str):
         response = {
             key: value
             for key, value in job.items()
-            if key not in {"output_path", "live_frame"}
+            if key not in {
+                "output_path",
+                "live_frame",
+                "last_frame_publish_at",
+            }
         }
 
         # Disponibiliza as rotas do vídeo quando o processamento termina.
@@ -374,7 +502,7 @@ async def stream_job_frames(
             if status in {"completed", "failed"}:
                 break
 
-            await asyncio.sleep(0.03)
+            await asyncio.sleep(0.05)
 
     except WebSocketDisconnect:
         pass
@@ -464,11 +592,23 @@ async def detect_image(file: UploadFile = File(...)):
 
     # Define um caminho temporário para armazenar a imagem.
     input_path = UPLOAD_DIR / f"{uuid.uuid4().hex}{extension}"
+    uploaded_size = 0
 
     try:
         # Salva a imagem enviada para processamento.
         with input_path.open("wb") as destination:
             while chunk := await file.read(1024 * 1024):
+                uploaded_size += len(chunk)
+
+                if uploaded_size > 25 * 1024 * 1024:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            "A imagem excede o limite máximo "
+                            "de 25 MB."
+                        ),
+                    )
+
                 destination.write(chunk)
 
         # Impede o processamento de arquivos vazios.
@@ -477,6 +617,8 @@ async def detect_image(file: UploadFile = File(...)):
                 status_code=400,
                 detail="O arquivo está vazio.",
             )
+
+        log_memory("imagem: antes do processamento")
 
         # Executa a detecção e gera a imagem com os objetos identificados.
         with model_lock:
@@ -487,6 +629,8 @@ async def detect_image(file: UploadFile = File(...)):
                 input_path,
                 model,
             )
+
+        log_memory("imagem: processamento concluído")
 
         # Retorna a imagem processada.
         return FileResponse(
@@ -500,6 +644,7 @@ async def detect_image(file: UploadFile = File(...)):
         # Remove o arquivo temporário após o processamento.
         input_path.unlink(missing_ok=True)
         await file.close()
+        gc.collect()
 
 
 # Encerra o executor quando a aplicação é desligada.
