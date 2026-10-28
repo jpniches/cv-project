@@ -1,10 +1,10 @@
-
+# Arquivo usado para expor o modelo para o resto dos arquivos da api
 from functools import lru_cache
 from pathlib import Path
 
 from ultralytics import YOLO
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
+ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 MODEL_PATH = ROOT_DIR / "models" / "best.pt"
 
 
