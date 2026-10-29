@@ -178,7 +178,7 @@ def process_video(
 
         # Otimiza o vídeo de entrada antes de iniciar a detecção.
         print(f"Otimizando vídeo: {input_path.name}", flush=True)
-        optimized_path = optimizer.optimize(input_path)
+        optimized_path = input_path
 
         log_memory(
             f"{input_path.name}: depois da otimização"
