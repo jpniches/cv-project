@@ -204,7 +204,7 @@ def process_video(
 
         # Define um FPS padrão caso os metadados sejam inválidos.
         if fps <= 0:
-            fps = 30.0
+            fps = 15.0
 
         # Converte o tempo mínimo de rastreamento em quantidade de frames.
         min_track_frames = max(
@@ -444,8 +444,12 @@ def process_video(
                     reset()
 
         # Remove o arquivo temporário gerado durante a otimização.
-        if optimized_path is not None:
+        if (
+            optimized_path is not None
+            and optimized_path != input_path
+        ):
             optimizer.cleanup(optimized_path)
+        
 
         gc.collect()
 

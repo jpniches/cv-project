@@ -9,7 +9,7 @@ class VideoOptimizer:
         self,
         output_width: int = 1280,
         output_height: int = 720,
-        fps: int = 30,
+        fps: int = 15,
         video_codec: str = "libx264",
         preset: str = "ultrafast",
         crf: int = 28,
@@ -62,6 +62,7 @@ class VideoOptimizer:
             "-preset", self.preset,
             "-crf", str(self.crf),
             "-pix_fmt", "yuv420p",
+            "-threads", "1",
             "-movflags", "+faststart",
             str(output_path),
         ]
